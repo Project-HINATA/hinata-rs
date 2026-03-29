@@ -2,6 +2,9 @@
 name = "hinata"
 version = "0.2.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "A library to communicate with HINATA card reader"
+repository = "https://github.com/Project-HINATA/hinata-rs"
 
 [dependencies]
 thiserror = "2.0.18"
