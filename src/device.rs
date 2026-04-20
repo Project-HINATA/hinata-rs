@@ -49,24 +49,38 @@ impl Pn532Port for HinataDevice {
             .send(InMessage::SendPacketAndSubscribe(send, subscription))
             .await;
 
-        let standard_ack = [0, 0, 0xFF, 0, 0xFF, 0];
+        // let standard_ack = [0, 0, 0xFF, 0, 0xFF, 0];
 
-        let ack = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
-        if &ack[1..7] != &standard_ack {
-            return Err(Error::Protocol("ack error".to_string()));
+        loop {
+            let res = Self::receive_packet(&mut rx, Duration::from_millis(200)).await?;
+            let len = res.get(4).ok_or(Error::Other("packet length error".to_string()))?;
+            let len_rev = res.get(5).ok_or(Error::Other("packet length error".to_string()))?;
+            if *len == 0 && *len_rev == 0xFF { // ack
+                continue
+            } else if (*len + *len_rev) & 0xFF != 0 {
+                return Err(Error::Other("Invalid length checksum (LCS)".into()));
+            }
+            if *len > 0 {
+                let res_packet = Pn532Packet::from_bytes(&res[1..]).map_err(|e| Error::Protocol(e))?;
+                return Ok(res_packet.payload);
+            }
         }
-
-        let res = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
-        let res_packet = Pn532Packet::from_bytes(&res[1..]).map_err(|e| Error::Protocol(e))?;
-
-        if res_packet.direction != Pn532Direction::Pn532ToHost {
-            return Err(Error::Protocol("Direction mismatch".to_string()));
-        };
-        if res_packet.command != packet.command {
-            return Err(Error::Protocol("Command mismatch".to_string()));
-        };
-
-        Ok(res_packet.payload)
+        // let ack = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
+        // if &ack[1..7] != &standard_ack {
+        //     return Err(Error::Protocol("ack error".to_string()));
+        // }
+        //
+        // let res = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
+        // let res_packet = Pn532Packet::from_bytes(&res[1..]).map_err(|e| Error::Protocol(e))?;
+        //
+        // if res_packet.direction != Pn532Direction::Pn532ToHost {
+        //     return Err(Error::Protocol("Direction mismatch".to_string()));
+        // };
+        // if res_packet.command != packet.command {
+        //     return Err(Error::Protocol("Command mismatch".to_string()));
+        // };
+        //
+        // Ok(res_packet.payload)
     }
 }
 
