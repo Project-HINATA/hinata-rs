@@ -3,7 +3,7 @@ use winreg::RegKey;
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows::Win32::Devices::Properties::{DEVPKEY_Device_ClassGuid, DEVPROPTYPE, DEVPROP_TYPE_GUID};
-use crate::error::{Error, HinataResult};
+use crate::error::{Error, HinataResult, PlatformError};
 
 const GUID_DEVCLASS_PORTS: GUID = GUID::from_u128(0x4d36e978_e325_11ce_bfc1_08002be10318);
 
@@ -29,7 +29,7 @@ pub fn get_com_instance_id_by_hid_instance_id(instance_id: &str) -> HinataResult
         );
 
         if ret != CR_SUCCESS {
-            return Err(Error::NotFound(format!("Could not locate device node: {}", instance_id)));
+            return Err(Error::Platform(PlatformError::Win32(ret.0 as u32)));
         }
 
         // 3. 开始向上爬树循环 (最多爬 3-4 层足够了，防止死循环)
@@ -54,7 +54,7 @@ pub fn get_com_instance_id_by_hid_instance_id(instance_id: &str) -> HinataResult
         }
     }
 
-    Err(Error::NotFound("Associated Serial device (Class Ports) not found in ancestry tree".to_string()))
+    Err(Error::Platform(PlatformError::SerialDeviceNotFound))
 }
 
 /// 辅助函数：检查指定父节点的所有直接子节点，看有没有 Ports 类型的

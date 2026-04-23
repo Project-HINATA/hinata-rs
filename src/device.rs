@@ -1,4 +1,4 @@
-use crate::error::{Error, HinataResult};
+use crate::error::{Error, HinataResult, PlatformError, ProtocolError};
 use crate::message::{InMessage, OutMessage, Subscription, UnSubscribePolicy};
 use crate::pn532::{Pn532, Pn532Command, Pn532Direction, Pn532Packet, Pn532Port};
 use crate::types::HidDevicePath;
@@ -49,38 +49,20 @@ impl Pn532Port for HinataDevice {
             .send(InMessage::SendPacketAndSubscribe(send, subscription))
             .await;
 
-        // let standard_ack = [0, 0, 0xFF, 0, 0xFF, 0];
-
         loop {
             let res = Self::receive_packet(&mut rx, Duration::from_millis(200)).await?;
-            let len = res.get(4).ok_or(Error::Other("packet length error".to_string()))?;
-            let len_rev = res.get(5).ok_or(Error::Other("packet length error".to_string()))?;
+            let len = res.get(4).ok_or(Error::Protocol(ProtocolError::PacketTooShort))?;
+            let len_rev = res.get(5).ok_or(Error::Protocol(ProtocolError::PacketTooShort))?;
             if *len == 0 && *len_rev == 0xFF { // ack
                 continue
             } else if (*len + *len_rev) & 0xFF != 0 {
-                return Err(Error::Other("Invalid length checksum (LCS)".into()));
+                return Err(Error::Protocol(ProtocolError::InvalidLcs));
             }
             if *len > 0 {
-                let res_packet = Pn532Packet::from_bytes(&res[1..]).map_err(|e| Error::Protocol(e))?;
+                let res_packet = Pn532Packet::from_bytes(&res[1..])?;
                 return Ok(res_packet.payload);
             }
         }
-        // let ack = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
-        // if &ack[1..7] != &standard_ack {
-        //     return Err(Error::Protocol("ack error".to_string()));
-        // }
-        //
-        // let res = Self::receive_packet(&mut rx, Duration::from_millis(1000)).await?;
-        // let res_packet = Pn532Packet::from_bytes(&res[1..]).map_err(|e| Error::Protocol(e))?;
-        //
-        // if res_packet.direction != Pn532Direction::Pn532ToHost {
-        //     return Err(Error::Protocol("Direction mismatch".to_string()));
-        // };
-        // if res_packet.command != packet.command {
-        //     return Err(Error::Protocol("Command mismatch".to_string()));
-        // };
-        //
-        // Ok(res_packet.payload)
     }
 }
 
@@ -170,7 +152,7 @@ impl HinataDevice {
     pub async fn get_chip_id(&mut self) -> HinataResult<[u8; 4]> {
         let timestamp = self.get_firmware_timestamp().await?;
         if timestamp < 2025051301 {
-            return Err(Error::NotSupport("Firmware version too old".into()));
+            return Err(Error::FirmwareTooOld);
         };
         let chip_id = if let Some(id) = self.info.chip_id {
             id
@@ -187,14 +169,14 @@ impl HinataDevice {
         let array: [u8; 4] = data
             .get(..4)
             .and_then(|slice| slice.try_into().ok())
-            .ok_or(Error::Protocol("buffer size error".into()))?;
+            .ok_or(Error::Protocol(ProtocolError::BufferSizeError))?;
         Ok(array)
     }
 
     pub async fn get_firmware_commit_hash(&mut self) -> HinataResult<[u8; 4]> {
         let timestamp = self.get_firmware_timestamp().await?;
         if timestamp < 2025051301 {
-            return Err(Error::NotSupport("Firmware version too old".into()));
+            return Err(Error::FirmwareTooOld);
         };
         let commit_hash = if let Some(hash) = self.info.firmware_commit_hash {
             hash

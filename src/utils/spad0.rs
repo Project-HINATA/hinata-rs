@@ -170,11 +170,13 @@ fn rotate_left(data: &mut [u8], n_bytes: usize, n_bits: usize) {
     }
 }
 
-pub fn spad0_encrypt(input: &[u8]) -> Result<Vec<u8>, String> {
+use crate::error::{Error, HinataResult, ProtocolError};
+
+pub fn spad0_encrypt(input: &[u8]) -> HinataResult<Vec<u8>> {
     let mut spad = input.to_vec();
 
     if spad.len() < 16 {
-        return Err("Input data too short for spad0_encrypt".to_string());
+        return Err(Error::Protocol(ProtocolError::InputTooShort));
     }
 
     let count = (spad[15] >> 4) as usize + 7;
@@ -191,7 +193,7 @@ pub fn spad0_encrypt(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(spad.iter().map(|&b| S_BOX[N_TABLES][b as usize]).collect())
 }
 
-pub fn spad0_decrypt(input: &[u8]) -> Result<Vec<u8>, String> {
+pub fn spad0_decrypt(input: &[u8]) -> HinataResult<Vec<u8>> {
     let mut s_box_inv = [[0u8; 256]; 9];
 
     for i in 0..9 {
@@ -207,7 +209,7 @@ pub fn spad0_decrypt(input: &[u8]) -> Result<Vec<u8>, String> {
         .collect();
 
     if spad.len() < 16 {
-        return Err("Input data too short for spad0_decrypt".to_string());
+        return Err(Error::Protocol(ProtocolError::InputTooShort));
     }
 
     let count = (spad[15] >> 4) as usize + 7;

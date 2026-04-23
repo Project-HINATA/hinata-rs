@@ -1,5 +1,5 @@
 use crate::device::{Config, HinataDevice, Info};
-use crate::error::HinataResult;
+use crate::error::{Error, HinataResult, PlatformError};
 use crate::message::{InMessage, OutMessage, Subscription};
 use crate::types::HidDevicePath;
 use crate::utils::device_parse::parse_hid_path;
@@ -92,7 +92,7 @@ impl HinataDeviceBuilder {
     pub fn build(&self, debug: bool) -> HinataResult<HinataDevice> {
         let (main_to_sub_tx, main_to_sub_rx): (Sender<InMessage>, Receiver<InMessage>) =
             mpsc::channel(255);
-        let conn = self.connection.build()?;
+        let conn = self.connection.build().map_err(|e| Error::Platform(PlatformError::Hid(e)))?;
 
         let (read, write) = match &self.connection {
             HidConnectionBuilder::Dual {

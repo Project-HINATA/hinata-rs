@@ -2,9 +2,8 @@ use std::io::{Cursor, Read};
 use async_trait::async_trait;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::FromPrimitive;
-use thiserror::Error;
 use crate::card::{Felica, Iso14443a, PassiveTarget};
-use crate::error::{Error, HinataResult};
+use crate::error::{Error, HinataResult, ProtocolError, Pn532Error};
 use byteorder::{BigEndian, ReadBytesExt};
 
 
@@ -51,69 +50,6 @@ pub enum Pn532Command {
     TgGetTargetStatus = 0x8A,
 }
 
-#[derive(FromPrimitive, ToPrimitive, Debug, Error, PartialEq)]
-#[repr(u8)]
-pub enum Pn532Error {
-    #[error("No error")]
-    None = 0x00,
-    #[error("Time Out, the target has not answered")]
-    Timeout = 0x01,
-    #[error("A CRC error has been detected by the CIU")]
-    Crc = 0x02,
-    #[error("A Parity error has been detected by the CIU")]
-    Parity = 0x03,
-    #[error("Erroneous Bit Count detected during anti-collision/select")]
-    CollisionBitCount = 0x04,
-    #[error("Framing error during MIFARE operation")]
-    MifareFraming = 0x05,
-    #[error("Abnormal bit-collision detected during bit wise anti-collision at 106 kbps")]
-    CollisionBitCollision = 0x06,
-    #[error("Communication buffer size insufficient")]
-    NoBufs = 0x07,
-    #[error("RF Buffer overflow has been detected by the CIU")]
-    RfNoBufs = 0x09,
-    #[error("RF field has not been switched on in time by the counterpart")]
-    ActiveTooSlow = 0x0A,
-    #[error("RF Protocol error")]
-    RfProto = 0x0B,
-    #[error("Internal temperature sensor has detected overheating")]
-    TooHot = 0x0D,
-    #[error("Internal buffer overflow")]
-    InternalNoBufs = 0x0E,
-    #[error("Invalid parameter (range, format...)")]
-    Inval = 0x10,
-    #[error("DEP Protocol: Unsupported command received from the initiator")]
-    DepInvalidCommand = 0x12,
-    #[error("DEP Protocol, MIFARE or ISO/IEC14443-4: Data format mismatch")]
-    DepBadData = 0x13,
-    #[error("MIFARE: Authentication error")]
-    MifareAuth = 0x14,
-    #[error("Target or Initiator does not support NFC Secure")]
-    NoSecure = 0x18,
-    #[error("I2C bus line is Busy. A TDA transaction is on going")]
-    I2cBusy = 0x19,
-    #[error("ISO/IEC14443-3: UID Check byte is wrong")]
-    UidChecksum = 0x23,
-    #[error("DEP Protocol: Invalid device state")]
-    DepState = 0x25,
-    #[error("Operation not allowed in this configuration (host controller interface)")]
-    HciInval = 0x26,
-    #[error("Command not acceptable due to the current context")]
-    Context = 0x27,
-    #[error("The PN532 configured as target has been released by its initiator")]
-    Released = 0x29,
-    #[error("ISO/IEC14443-3B: Card ID does not match (card swapped)")]
-    CardSwapped = 0x2A,
-    #[error("ISO/IEC14443-3B: The card previously activated has disappeared")]
-    NoCard = 0x2B,
-    #[error("Mismatch between the NFCID3 initiator and target in DEP 212/424 kbps passive")]
-    Mismatch = 0x2C,
-    #[error("An over-current event has been detected")]
-    Overcurrent = 0x2D,
-    #[error("NAD missing in DEP frame")]
-    NoNad = 0x2E,
-}
-
 pub enum Pn532ApplicationError {}
 
 #[derive(FromPrimitive, ToPrimitive)]
@@ -157,31 +93,33 @@ impl Pn532Packet {
         }
     }
 
-    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(data: &[u8]) -> HinataResult<Self> {
         if data.len() < 9 {
-            return Err("Packet too short".into());
+            return Err(Error::Protocol(ProtocolError::PacketTooShort));
         }
 
         if data[0] != 0x00 || data[1] != 0x00 || data[2] != 0xFF {
-            return Err("Invalid preamble".into());
+            return Err(Error::Protocol(ProtocolError::InvalidPreamble));
         }
 
         let payload_len = data[3];
         let lcs = data[4];
         if payload_len.wrapping_add(lcs) != 0 {
-            return Err("Invalid length checksum (LCS)".into());
+            return Err(Error::Protocol(ProtocolError::InvalidLcs));
         }
 
-        let direction = Pn532Direction::from_u8(data[5]).ok_or_else(|| "Invalid direction".to_string())?;
+        let direction_byte = data[5];
+        let direction = Pn532Direction::from_u8(direction_byte).ok_or(Error::Protocol(ProtocolError::InvalidDirection(direction_byte)))?;
 
+        let cmd_byte = data[6];
         let cmd = Pn532Command::from_u8(match direction {
-            Pn532Direction::HostToPn532 => data[6],
-            Pn532Direction::Pn532ToHost => data[6] - 1
-        }).ok_or_else(|| "Invalid command".to_string())?;
+            Pn532Direction::HostToPn532 => cmd_byte,
+            Pn532Direction::Pn532ToHost => cmd_byte - 1
+        }).ok_or(Error::Protocol(ProtocolError::InvalidCommand(cmd_byte)))?;
 
         let dcs_index = 5 + payload_len as usize;
         if data.len() <= dcs_index {
-            return Err("Packet truncated".into());
+            return Err(Error::Protocol(ProtocolError::PacketTruncated));
         }
 
         let mut checksum_sum: u8 = 0;
@@ -191,7 +129,7 @@ impl Pn532Packet {
 
         let expected_dcs = data[dcs_index];
         if checksum_sum.wrapping_add(expected_dcs) != 0 {
-            return Err(format!("Invalid checksum (DCS): sum=0x{:02X}, expected=0x{:02X}", checksum_sum, expected_dcs));
+            return Err(Error::Protocol(ProtocolError::InvalidDcs { sum: checksum_sum, expected: expected_dcs }));
         }
 
         let payload = data[7..dcs_index].to_vec();
@@ -260,8 +198,8 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
 
 
     fn get_error_code(data: &[u8]) -> HinataResult<()> {
-        let status_byte = data.get(0).ok_or(Error::Protocol("Empty response from InDataExchange".into()))?;
-        let error = Pn532Error::from_u8(*status_byte).ok_or(Error::Protocol(format!("Unknown status code from PN532: {status_byte}")))?;
+        let status_byte = data.get(0).ok_or(Error::Protocol(ProtocolError::EmptyResponse))?;
+        let error = Pn532Error::from_u8(*status_byte);
         if error == Pn532Error::None {
             Ok(())
         } else {
@@ -279,15 +217,15 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
 
     pub async fn mifare_classic_auth(&mut self, tg: u8, uid: &[u8], block_num: u8, key_num: MifareCommand, key: &[u8]) -> HinataResult<()> {
         let mut input = vec![block_num];
-        input.extend_from_slice(key.get(..6).ok_or(Error::Protocol("Mifare key must be 6 bytes".into()))?);
-        input.extend_from_slice(uid.get(..4).ok_or(Error::Protocol("Mifare UID must be at least 4 bytes for auth".into()))?);
+        input.extend_from_slice(key.get(..6).ok_or(Error::Protocol(ProtocolError::InvalidMifareKeyLength))?);
+        input.extend_from_slice(uid.get(..4).ok_or(Error::Protocol(ProtocolError::InvalidMifareUidLength))?);
         self.in_data_exchange(tg, key_num as u8, &input).await?;
         Ok(())
     }
 
     pub async fn mifare_classic_write_block(&mut self, tg: u8, block_num: u8, data: &[u8]) -> HinataResult<()> {
         let mut input = vec![block_num];
-        input.extend_from_slice(data.get(..16).ok_or(Error::Protocol("Mifare block data must be 16 bytes".into()))?);
+        input.extend_from_slice(data.get(..16).ok_or(Error::Protocol(ProtocolError::InvalidMifareBlockLength))?);
         self.in_data_exchange(tg, MifareCommand::Write as u8, &input).await?;
         Ok(())
     }
@@ -296,7 +234,7 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
         let input = [block_num];
         let res = self.in_data_exchange(tg, MifareCommand::Read as u8, &input).await?;
 
-        let block_data = res.get(1..17).ok_or(Error::Protocol("Invalid data length in Mifare read response".into()))?;
+        let block_data = res.get(1..17).ok_or(Error::Protocol(ProtocolError::InvalidResponseLength))?;
         let mut block = [0u8; 16];
         block.copy_from_slice(block_data);
         Ok(block)
@@ -315,7 +253,7 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
 
     pub async fn felica_read_without_encryption(&mut self, tg: u8, idm: &[u8], services: &[u16], blocks: &[u16]) -> HinataResult<Vec<u8>> {
         let mut input = vec![FelicaCommand::ReadWithoutEncryption as u8];
-        input.extend_from_slice(idm.get(..8).ok_or(Error::Protocol("Felica IDM must be 8 bytes".to_string()))?);
+        input.extend_from_slice(idm.get(..8).ok_or(Error::Protocol(ProtocolError::InvalidFelicaIdmLength))?);
         input.push(services.len() as u8);
         for &service in services {
             input.extend_from_slice(&service.to_be_bytes());
@@ -352,7 +290,7 @@ fn parse_in_list_passive_target(data: &[u8], brty: u8) -> HinataResult<Vec<Passi
             },
             1 | 2 => { // FeliCa
                 let len = cursor.read_u8()? as usize;
-                if len < 18 { return Err(Error::Other("Len error".into())); }
+                if len < 18 { return Err(Error::Protocol(ProtocolError::InvalidResponseLength)); }
 
                 let _code = cursor.read_u8()?; // 跳过 code
 
@@ -370,7 +308,7 @@ fn parse_in_list_passive_target(data: &[u8], brty: u8) -> HinataResult<Vec<Passi
 
                 tags.push(PassiveTarget::Felica(Felica::new(idm, pmm, sys_codes)));
             }
-            _ => return Err(Error::Protocol("Not Supported".into())),
+            _ => return Err(Error::NotSupport("Unsupported brty".into())),
         }
     }
     Ok(tags)

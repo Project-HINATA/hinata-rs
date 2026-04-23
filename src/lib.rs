@@ -13,9 +13,9 @@ use crate::builder::{find_devices_inner, HinataDeviceBuilder};
 use crate::error::HinataResult;
 
 pub async fn find_devices(exclude: Vec<String>) -> HinataResult<Vec<HinataDeviceBuilder>> {
-    spawn_blocking(|| find_devices_inner(exclude)
-        .map_err(|_| Error::NotFound("Device not found".to_string()))).await
-        .map_err(|e| Error::Other(e.to_string()))?
+    let res = spawn_blocking(|| find_devices_inner(exclude)).await
+        .map_err(|e| Error::Other(e.to_string()))?;
+    res.map_err(Error::from)
 }
 
 #[cfg(test)]
