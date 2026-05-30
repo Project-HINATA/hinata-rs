@@ -55,7 +55,7 @@ impl Pn532Port for HinataDevice {
             let len_rev = res.get(5).ok_or(Error::Protocol(ProtocolError::PacketTooShort))?;
             if *len == 0 && *len_rev == 0xFF { // ack
                 continue
-            } else if (*len + *len_rev) & 0xFF != 0 {
+            } else if (*len).wrapping_add(*len_rev) != 0 {
                 return Err(Error::Protocol(ProtocolError::InvalidLcs));
             }
             if *len > 0 {
