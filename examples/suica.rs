@@ -1,15 +1,41 @@
 use hinata::find_devices;
 use hinata::pn532::gen_felica_poll_initial_data;
 use hinata::card::PassiveTarget;
+use std::collections::HashMap;
 
-fn parse_suica_history(block: &[u8]) -> String {
+#[derive(Debug, Clone)]
+struct StationInfo {
+    line_name: String,
+    station_name: String,
+}
+
+// Embed the pre-generated static mapping table
+static STATION_MAP: &[(u8, u8, u8, &str, &str)] = include!("ekicode_data.rs");
+
+fn load_ekicode() -> HashMap<(u8, u8, u8), StationInfo> {
+    STATION_MAP
+        .iter()
+        .map(|&(region, line_code, station_code, line_name, station_name)| {
+            (
+                (region, line_code, station_code),
+                StationInfo {
+                    line_name: line_name.to_string(),
+                    station_name: station_name.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+
+fn parse_suica_history(block: &[u8], ekicode_map: &HashMap<(u8, u8, u8), StationInfo>) -> String {
     if block.len() < 16 {
         return "Invalid block size".to_string();
     }
     let console_type = block[0];
     let process_type = block[1];
-    let payment_type = block[2];
-    let entry_exit_type = block[3];
+    let _payment_type = block[2];
+    let _entry_exit_type = block[3];
     
     // Bytes 4-5 are the Date (stored in a packed big-endian format)
     let date_raw = ((block[4] as u16) << 8) | (block[5] as u16);
@@ -28,7 +54,9 @@ fn parse_suica_history(block: &[u8]) -> String {
     
     // Bytes 13-14: Sequence Number (big-endian)
     let seq = ((block[13] as u32) << 8) | (block[14] as u32);
-    let region = block[15];
+    
+    // Byte 15 upper 4 bits store the Region Code
+    let region = block[15] >> 4;
 
     let console_str = match console_type {
         0x03 => "Ticket Machine (精算機/券売機)",
@@ -37,7 +65,7 @@ fn parse_suica_history(block: &[u8]) -> String {
         0x08 => "Window Terminal (窓口控除)",
         0x09 => "Mobile Phone (携帯電話)",
         0x0d => "Bus (Flat Fare) (均一運賃バス)",
-        0x0f => "Bus (Distance Fare) (多区間運賃バス)",
+        0x0f => "Bus (Distance Fare) (多区间运区バス)",
         0x12 => "Vending Machine (自販机)",
         0x16 => "Automatic Gate (自動改札機)",
         0x17 => "Simple Gate (簡易改札機)",
@@ -46,7 +74,7 @@ fn parse_suica_history(block: &[u8]) -> String {
         0x1a => "Simple Gate (IC改札窓口)",
         0x1b => "Mobile Terminal (モバイル端末)",
         0x1c => "Transfer Adjustment Machine (乗継精算機)",
-        0x1f => "Simple Deposit Machine (簡易入金機)",
+        0x1f => "Simple Deposit Machine (簡易入金机)",
         0x46 => "E-Money/Shopping Terminal (物販端末)",
         0x4b => "Simple Shopping Terminal (簡易物販端末)",
         _ => "Unknown Terminal (未知终端)",
@@ -79,10 +107,17 @@ fn parse_suica_history(block: &[u8]) -> String {
         // Shopping transaction: Line and Station bytes represent Hour and Minute or Category
         format!("Store/Time: {:02}:{:02}", entry_line, entry_station)
     } else {
-        format!(
-            "Entry: [Line 0x{:02X}, Station 0x{:02X}] -> Exit: [Line 0x{:02X}, Station 0x{:02X}]",
-            entry_line, entry_station, exit_line, exit_station
-        )
+        let entry_station_str = match ekicode_map.get(&(region, entry_line, entry_station)) {
+            Some(info) => format!("{} ({})", info.station_name, info.line_name),
+            None => format!("Line 0x{:02X}, Station 0x{:02X}", entry_line, entry_station),
+        };
+        
+        let exit_station_str = match ekicode_map.get(&(region, exit_line, exit_station)) {
+            Some(info) => format!("{} ({})", info.station_name, info.line_name),
+            None => format!("Line 0x{:02X}, Station 0x{:02X}", exit_line, exit_station),
+        };
+
+        format!("{} ──► {}", entry_station_str, exit_station_str)
     };
 
     format!(
@@ -94,10 +129,14 @@ fn parse_suica_history(block: &[u8]) -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==================================================");
-    println!("          HINATA Suica Balance Reader             ");
+    println!("          HINATA Suica Balance & Station Reader   ");
     println!("==================================================");
 
-    println!("Finding Hinata reader devices...");
+    println!("Loading Japanese Station Code Map (ekicode.csv)...");
+    let ekicode_map = load_ekicode();
+    println!("Successfully loaded {} station mapping records.", ekicode_map.len());
+
+    println!("\nFinding Hinata reader devices...");
     let builders = find_devices(vec![]).await?;
     if builders.is_empty() {
         println!("Error: No Hinata reader devices found.");
@@ -169,8 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let block_data = &response[14..30];
                                 let hex_str = block_data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
                                 
-                                // Parse and decode the 16-byte block
-                                let parsed_info = parse_suica_history(block_data);
+                                // Parse and decode the 16-byte block using the ekicode map
+                                let parsed_info = parse_suica_history(block_data, &ekicode_map);
                                 
                                 println!("Block {:02} [Raw: {}]", block_index, hex_str);
                                 println!("         └─► {}", parsed_info);
