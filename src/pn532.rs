@@ -246,9 +246,34 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
         Self::get_error_code(&res)
     }
 
+    pub async fn in_deselect(&mut self, tg: u8) -> HinataResult<()> {
+        let res = self.port.request(Pn532Command::InDeselect, &[tg]).await?;
+        Self::get_error_code(&res)
+    }
+
     pub async fn in_select(&mut self, tg: u8) -> HinataResult<()> {
         let res = self.port.request(Pn532Command::InSelect, &[tg]).await?;
         Self::get_error_code(&res)
+    }
+
+    pub async fn set_type_a_rf_power(&mut self, cw_gs_n_on: u8, cw_gs_p: u8) -> HinataResult<()> {
+        if cw_gs_n_on > 0x0F {
+            return Err(Error::Protocol(ProtocolError::InvalidTypeACwGsNOn(
+                cw_gs_n_on,
+            )));
+        }
+        if cw_gs_p > 0x3F {
+            return Err(Error::Protocol(ProtocolError::InvalidTypeACwGsP(cw_gs_p)));
+        }
+
+        let gs_n_on = (cw_gs_n_on << 4) | 0x04;
+        let payload = [
+            0x0A, 0x59, gs_n_on, cw_gs_p, 0x11, 0x4D, 0x85, 0x61, 0x6F, 0x26, 0x62, 0x87,
+        ];
+        self.port
+            .request(Pn532Command::RfConfiguration, &payload)
+            .await?;
+        Ok(())
     }
 
     pub async fn felica_read_without_encryption(&mut self, tg: u8, idm: &[u8], services: &[u16], blocks: &[u16]) -> HinataResult<Vec<u8>> {
@@ -333,4 +358,78 @@ fn packet_test() {
     println!("{:02X?}", packet.to_bytes());
     println!("{:02X?}", packet2.to_bytes());
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingPort {
+        requests: Vec<(Pn532Command, Vec<u8>)>,
+        response: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Pn532Port for RecordingPort {
+        async fn request(
+            &mut self,
+            command: Pn532Command,
+            payload: &[u8],
+        ) -> HinataResult<Vec<u8>> {
+            self.requests.push((command, payload.to_vec()));
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn in_deselect_sends_target_action_command() {
+        let mut port = RecordingPort {
+            response: vec![0],
+            ..Default::default()
+        };
+
+        Pn532::new(&mut port).in_deselect(3).await.unwrap();
+
+        assert_eq!(port.requests, vec![(Pn532Command::InDeselect, vec![3])]);
+    }
+
+    #[tokio::test]
+    async fn set_type_a_rf_power_sends_complete_analog_settings() {
+        let mut port = RecordingPort::default();
+
+        Pn532::new(&mut port)
+            .set_type_a_rf_power(0x0C, 0x28)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            port.requests,
+            vec![(
+                Pn532Command::RfConfiguration,
+                vec![
+                    0x0A, 0x59, 0xC4, 0x28, 0x11, 0x4D, 0x85, 0x61, 0x6F, 0x26, 0x62, 0x87,
+                ],
+            )],
+        );
+    }
+
+    #[tokio::test]
+    async fn set_type_a_rf_power_rejects_values_outside_register_ranges() {
+        let mut port = RecordingPort::default();
+
+        assert!(
+            Pn532::new(&mut port)
+                .set_type_a_rf_power(0x10, 0x28)
+                .await
+                .is_err()
+        );
+        assert!(
+            Pn532::new(&mut port)
+                .set_type_a_rf_power(0x0C, 0x40)
+                .await
+                .is_err()
+        );
+        assert!(port.requests.is_empty());
+    }
 }

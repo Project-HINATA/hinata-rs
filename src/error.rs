@@ -98,6 +98,12 @@ pub enum ProtocolError {
     #[error("Felica IDM must be 8 bytes")]
     InvalidFelicaIdmLength,
 
+    #[error("Type A CWGsNOn must be between 0x00 and 0x0F, got 0x{0:02X}")]
+    InvalidTypeACwGsNOn(u8),
+
+    #[error("Type A CWGsP must be between 0x00 and 0x3F, got 0x{0:02X}")]
+    InvalidTypeACwGsP(u8),
+
     #[error("Encryption error: {0}")]
     Encryption(String),
 }
