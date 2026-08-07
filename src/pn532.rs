@@ -207,6 +207,12 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
         }
     }
 
+    fn ensure_response(data: &[u8]) -> HinataResult<()> {
+        data.first()
+            .map(|_| ())
+            .ok_or(Error::Protocol(ProtocolError::EmptyResponse))
+    }
+
     pub async fn in_data_exchange(&mut self, tg: u8, cmd: u8, data: &[u8]) -> HinataResult<Vec<u8>> {
         let mut payload = vec![tg, cmd];
         payload.extend_from_slice(data);
@@ -243,12 +249,12 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
 
     pub async fn in_release(&mut self, tg: u8) -> HinataResult<()> {
         let res = self.port.request(Pn532Command::InRelease, &[tg]).await?;
-        Self::get_error_code(&res)
+        Self::ensure_response(&res)
     }
 
     pub async fn in_deselect(&mut self, tg: u8) -> HinataResult<()> {
         let res = self.port.request(Pn532Command::InDeselect, &[tg]).await?;
-        Self::get_error_code(&res)
+        Self::ensure_response(&res)
     }
 
     pub async fn in_select(&mut self, tg: u8) -> HinataResult<()> {
@@ -382,6 +388,19 @@ mod tests {
         }
     }
 
+    struct FailingPort;
+
+    #[async_trait]
+    impl Pn532Port for FailingPort {
+        async fn request(
+            &mut self,
+            _command: Pn532Command,
+            _payload: &[u8],
+        ) -> HinataResult<Vec<u8>> {
+            Err(Error::Timeout("scripted cleanup timeout".into()))
+        }
+    }
+
     #[tokio::test]
     async fn in_deselect_sends_target_action_command() {
         let mut port = RecordingPort {
@@ -392,6 +411,40 @@ mod tests {
         Pn532::new(&mut port).in_deselect(3).await.unwrap();
 
         assert_eq!(port.requests, vec![(Pn532Command::InDeselect, vec![3])]);
+    }
+
+    #[tokio::test]
+    async fn target_cleanup_ignores_unknown_target_status() {
+        let mut release_port = RecordingPort {
+            response: vec![0x27],
+            ..Default::default()
+        };
+        let mut deselect_port = RecordingPort {
+            response: vec![0x27],
+            ..Default::default()
+        };
+
+        Pn532::new(&mut release_port).in_release(1).await.unwrap();
+        Pn532::new(&mut deselect_port).in_deselect(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn target_cleanup_rejects_empty_response() {
+        let mut port = RecordingPort::default();
+
+        let result = Pn532::new(&mut port).in_release(1).await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::EmptyResponse))
+        ));
+    }
+
+    #[tokio::test]
+    async fn target_cleanup_preserves_transport_errors() {
+        let result = Pn532::new(&mut FailingPort).in_release(1).await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
     }
 
     #[tokio::test]
