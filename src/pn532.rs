@@ -300,6 +300,10 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
 }
 
 fn parse_in_list_passive_target(data: &[u8], brty: u8) -> HinataResult<Vec<PassiveTarget>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut cursor = Cursor::new(data);
 
     let tag_num = cursor.read_u8()?;
@@ -369,6 +373,14 @@ fn packet_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_in_list_response_is_no_targets() {
+        assert_eq!(
+            parse_in_list_passive_target(&[], 0).unwrap(),
+            Vec::<PassiveTarget>::new()
+        );
+    }
 
     #[derive(Default)]
     struct RecordingPort {
