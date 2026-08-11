@@ -175,9 +175,6 @@ impl HinataDeviceBuilder {
                                 subscribes.insert(key, subscription);
                                 data_to_write = Some(data);
                             }
-                            InMessage::Subscribe(cmd, subscription) => {
-                                subscribes.insert(cmd, subscription);
-                            }
                             InMessage::UnSubscribe(cmd) => {
                                 subscribes.remove(&cmd);
                             }
