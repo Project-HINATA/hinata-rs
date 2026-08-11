@@ -6,6 +6,52 @@ use crate::card::{Felica, Iso14443a, PassiveTarget};
 use crate::error::{Error, HinataResult, ProtocolError, Pn532Error};
 use byteorder::{BigEndian, ReadBytesExt};
 
+pub const HINATA_STANDARD_PRODUCT_ID: u16 = 0x0147;
+pub const HINATA_LITE_PRODUCT_ID: u16 = 0x0148;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypeARfProfile {
+    pub rf_cfg: u8,
+    pub cw_gs_n_on: u8,
+    pub cw_gs_p: u8,
+}
+
+pub const PN532_DEFAULT_TYPE_A_RF_PROFILE: TypeARfProfile = TypeARfProfile {
+    rf_cfg: 0x59,
+    cw_gs_n_on: 0x0F,
+    cw_gs_p: 0x3F,
+};
+
+pub const HINATA_STANDARD_TYPE_A_RF_PROFILES: [TypeARfProfile; 2] = [
+    PN532_DEFAULT_TYPE_A_RF_PROFILE,
+    TypeARfProfile {
+        rf_cfg: 0x69,
+        cw_gs_n_on: 0x0F,
+        cw_gs_p: 0x2B,
+    },
+];
+
+pub const HINATA_LITE_TYPE_A_RF_PROFILES: [TypeARfProfile; 3] = [
+    TypeARfProfile {
+        rf_cfg: 0x29,
+        cw_gs_n_on: 0x03,
+        cw_gs_p: 0x11,
+    },
+    TypeARfProfile {
+        rf_cfg: 0x49,
+        cw_gs_n_on: 0x0B,
+        cw_gs_p: 0x0C,
+    },
+    PN532_DEFAULT_TYPE_A_RF_PROFILE,
+];
+
+pub fn type_a_rf_profiles_for_product_id(product_id: u16) -> &'static [TypeARfProfile] {
+    match product_id {
+        HINATA_STANDARD_PRODUCT_ID => &HINATA_STANDARD_TYPE_A_RF_PROFILES,
+        HINATA_LITE_PRODUCT_ID => &HINATA_LITE_TYPE_A_RF_PROFILES,
+        _ => std::slice::from_ref(&PN532_DEFAULT_TYPE_A_RF_PROFILE),
+    }
+}
 
 #[derive(FromPrimitive, ToPrimitive, Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
@@ -262,24 +308,46 @@ impl <'a, P: Pn532Port> Pn532<'a, P> {
         Self::get_error_code(&res)
     }
 
-    pub async fn set_type_a_rf_power(&mut self, cw_gs_n_on: u8, cw_gs_p: u8) -> HinataResult<()> {
-        if cw_gs_n_on > 0x0F {
+    pub async fn set_type_a_rf_profile(&mut self, profile: TypeARfProfile) -> HinataResult<()> {
+        if profile.cw_gs_n_on > 0x0F {
             return Err(Error::Protocol(ProtocolError::InvalidTypeACwGsNOn(
-                cw_gs_n_on,
+                profile.cw_gs_n_on,
             )));
         }
-        if cw_gs_p > 0x3F {
-            return Err(Error::Protocol(ProtocolError::InvalidTypeACwGsP(cw_gs_p)));
+        if profile.cw_gs_p > 0x3F {
+            return Err(Error::Protocol(ProtocolError::InvalidTypeACwGsP(
+                profile.cw_gs_p,
+            )));
         }
 
-        let gs_n_on = (cw_gs_n_on << 4) | 0x04;
+        let gs_n_on = (profile.cw_gs_n_on << 4) | 0x04;
         let payload = [
-            0x0A, 0x59, gs_n_on, cw_gs_p, 0x11, 0x4D, 0x85, 0x61, 0x6F, 0x26, 0x62, 0x87,
+            0x0A,
+            profile.rf_cfg,
+            gs_n_on,
+            profile.cw_gs_p,
+            0x11,
+            0x4D,
+            0x85,
+            0x61,
+            0x6F,
+            0x26,
+            0x62,
+            0x87,
         ];
         self.port
             .request(Pn532Command::RfConfiguration, &payload)
             .await?;
         Ok(())
+    }
+
+    pub async fn set_type_a_rf_power(&mut self, cw_gs_n_on: u8, cw_gs_p: u8) -> HinataResult<()> {
+        self.set_type_a_rf_profile(TypeARfProfile {
+            rf_cfg: PN532_DEFAULT_TYPE_A_RF_PROFILE.rf_cfg,
+            cw_gs_n_on,
+            cw_gs_p,
+        })
+        .await
     }
 
     pub async fn felica_read_without_encryption(&mut self, tg: u8, idm: &[u8], services: &[u16], blocks: &[u16]) -> HinataResult<Vec<u8>> {
@@ -476,6 +544,42 @@ mod tests {
                     0x0A, 0x59, 0xC4, 0x28, 0x11, 0x4D, 0x85, 0x61, 0x6F, 0x26, 0x62, 0x87,
                 ],
             )],
+        );
+    }
+
+    #[tokio::test]
+    async fn set_type_a_rf_profile_uses_the_selected_receiver_gain() {
+        let mut port = RecordingPort::default();
+
+        Pn532::new(&mut port)
+            .set_type_a_rf_profile(HINATA_STANDARD_TYPE_A_RF_PROFILES[1])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            port.requests,
+            vec![(
+                Pn532Command::RfConfiguration,
+                vec![
+                    0x0A, 0x69, 0xF4, 0x2B, 0x11, 0x4D, 0x85, 0x61, 0x6F, 0x26, 0x62, 0x87,
+                ],
+            )],
+        );
+    }
+
+    #[test]
+    fn type_a_rf_profiles_are_bound_to_the_reader_product() {
+        assert_eq!(
+            type_a_rf_profiles_for_product_id(HINATA_STANDARD_PRODUCT_ID),
+            HINATA_STANDARD_TYPE_A_RF_PROFILES,
+        );
+        assert_eq!(
+            type_a_rf_profiles_for_product_id(HINATA_LITE_PRODUCT_ID),
+            HINATA_LITE_TYPE_A_RF_PROFILES,
+        );
+        assert_eq!(
+            type_a_rf_profiles_for_product_id(0),
+            [PN532_DEFAULT_TYPE_A_RF_PROFILE],
         );
     }
 
