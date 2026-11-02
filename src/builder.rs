@@ -122,6 +122,7 @@ impl HinataDeviceBuilder {
             firmware_timestamp: 0,
             firmware_commit_hash: None,
             chip_id: None,
+            pn532_long_frames: None,
             instance_id: self.instance_id.clone(),
             path,
             device_name: self.device_name.clone(),

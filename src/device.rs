@@ -8,13 +8,24 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 const PN532_RESPONSE_HEADER: u8 = 0xE2;
+/// Continues a PN532 frame begun by a passthrough report.
+const PN532_MORE_HEADER: u8 = 0xEB;
 const PN532_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
+/// PN532 frame bytes one passthrough report carries after its command byte.
+const PN532_REPORT_BYTES: usize = 62;
+
+const GET_FEATURES_HEADER: u8 = 0xE7;
+/// Firmware since this build answers GET_FEATURES.
+const FEATURES_SINCE: u32 = 2026110220;
+/// PN532 frames longer than one HID report pass through, split over several.
+const FEATURE_PN532_LONG_FRAMES: u8 = 0x01;
 
 #[derive(Debug)]
 pub(crate) struct Info {
     pub firmware_timestamp: u32,
     pub firmware_commit_hash: Option<[u8; 4]>,
     pub chip_id: Option<[u8; 4]>,
+    pub pn532_long_frames: Option<bool>,
 
     pub instance_id: String,
     pub path: HidDevicePath,
@@ -28,11 +39,16 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn test_device(tx: Sender<InMessage>) -> HinataDevice {
+        test_device_with(tx, true)
+    }
+
+    fn test_device_with(tx: Sender<InMessage>, long_frames: bool) -> HinataDevice {
         HinataDevice::new(
             Info {
                 firmware_timestamp: 0,
                 firmware_commit_hash: None,
                 chip_id: None,
+                pn532_long_frames: Some(long_frames),
                 instance_id: "test".to_string(),
                 path: HidDevicePath {
                     read: "test-read".to_string(),
@@ -115,6 +131,78 @@ mod tests {
         expect_unsubscribe(&mut rx).await;
     }
 
+    /// [frame] as the firmware sends it: 62 bytes to a passthrough report.
+    fn reports_of(frame: &[u8]) -> Vec<Vec<u8>> {
+        frame[1..]
+            .chunks(PN532_REPORT_BYTES)
+            .map(|chunk| {
+                let mut report = vec![PN532_RESPONSE_HEADER];
+                report.extend_from_slice(chunk);
+                report.resize(PN532_REPORT_BYTES + 1, 0);
+                report
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pn532_request_splits_and_joins_long_frames() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut device = test_device(tx);
+        let data: Vec<u8> = (0..100).collect();
+        let sent = data.clone();
+        let request = tokio::spawn(async move {
+            <HinataDevice as Pn532Port>::request(
+                &mut device,
+                Pn532Command::InDataExchange,
+                &sent,
+            )
+            .await
+        });
+
+        let first = match rx.recv().await.expect("request message") {
+            InMessage::SendPacketAndSubscribe(first, subscription) => {
+                // Eight FeliCa blocks come back over three reports.
+                let answer: Vec<u8> = (0..141).map(|i| i as u8).collect();
+                let mut frames = vec![ack_frame()];
+                frames.extend(reports_of(&response_frame(
+                    Pn532Command::InDataExchange,
+                    answer,
+                )));
+                send_frames(subscription, frames).await;
+                first
+            }
+            _ => panic!("expected subscribed request"),
+        };
+        let more = match rx.recv().await.expect("continuation") {
+            InMessage::SendPacket(more) => more,
+            _ => panic!("expected continuation"),
+        };
+        // 109 frame bytes: 62 in the passthrough, 47 continued.
+        assert_eq!(first.len(), 2 + PN532_REPORT_BYTES);
+        assert_eq!(&more[..3], &[1, PN532_MORE_HEADER, 47]);
+        let mut frame = first[2..].to_vec();
+        frame.extend_from_slice(&more[3..]);
+        let packet = Pn532Packet::from_bytes(&frame).expect("joined request");
+        assert_eq!(packet.payload, data);
+
+        let expected: Vec<u8> = (0..141).map(|i| i as u8).collect();
+        assert_eq!(request.await.expect("request task").unwrap(), expected);
+        expect_unsubscribe(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn pn532_request_refuses_long_frames_without_firmware_support() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut device = test_device_with(tx, false);
+        let result = <HinataDevice as Pn532Port>::request(
+            &mut device,
+            Pn532Command::InDataExchange,
+            &[0; 100],
+        )
+        .await;
+        assert!(matches!(result, Err(Error::FirmwareTooOld)));
+    }
+
     #[tokio::test]
     async fn pn532_request_ignores_response_for_another_command() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -164,19 +252,41 @@ pub struct HinataDevice {
 #[async_trait]
 impl Pn532Port for HinataDevice {
     async fn request(&mut self, pn532_cmd: Pn532Command, payload: &[u8]) -> HinataResult<Vec<u8>> {
+        if payload.len() + 2 > u8::MAX as usize {
+            return Err(Error::Protocol(ProtocolError::BufferSizeError));
+        }
+        let packet = Pn532Packet::new(Pn532Direction::HostToPn532, pn532_cmd, payload.to_vec());
+        let frame = packet.to_bytes();
+        // A frame longer than one report goes out in a passthrough report,
+        // then continues in as many PN532_MORE_HEADER reports as it needs.
+        if frame.len() > PN532_REPORT_BYTES && !self.supports_pn532_long_frames().await? {
+            return Err(Error::FirmwareTooOld);
+        }
+        let (first, rest) = frame.split_at(frame.len().min(PN532_REPORT_BYTES));
+
         // Keep the subscription alive until the expected command arrives. A
         // timed-out PN532 operation can otherwise deliver its final frame to
         // the next request, because every passthrough packet shares 0xE2.
         let (subscription, mut rx) = Subscription::new(UnSubscribePolicy::Never);
-        let packet = Pn532Packet::new(Pn532Direction::HostToPn532, pn532_cmd, payload.to_vec());
         let mut send = vec![1, PN532_RESPONSE_HEADER];
-        send.extend_from_slice(&packet.to_bytes());
+        send.extend_from_slice(first);
 
         self.tx
             .send(InMessage::SendPacketAndSubscribe(send, subscription))
             .await
             .map_err(|_| Error::Disconnected("Device I/O loop disconnected".into()))?;
+        for chunk in rest.chunks(PN532_REPORT_BYTES - 1) {
+            let mut more = vec![1, PN532_MORE_HEADER, chunk.len() as u8];
+            more.extend_from_slice(chunk);
+            self.tx
+                .send(InMessage::SendPacket(more))
+                .await
+                .map_err(|_| Error::Disconnected("Device I/O loop disconnected".into()))?;
+        }
 
+        // The frame being joined from several reports, and its full size.
+        let mut joined: Vec<u8> = Vec::new();
+        let mut size = 0;
         let result = loop {
             // Firmware can keep a PN532 command alive for 500 ms and may then
             // wait up to another 250 ms for the HID IN endpoint. Waiting one
@@ -185,30 +295,53 @@ impl Pn532Port for HinataDevice {
                 Ok(res) => res,
                 Err(e) => break Err(e),
             };
-            let Some(len) = res.get(4) else {
-                break Err(Error::Protocol(ProtocolError::PacketTooShort));
-            };
-            let Some(len_rev) = res.get(5) else {
-                break Err(Error::Protocol(ProtocolError::PacketTooShort));
-            };
-            if *len == 0 && *len_rev == 0xFF {
-                // ack
-                continue;
-            } else if (*len).wrapping_add(*len_rev) != 0 {
-                break Err(Error::Protocol(ProtocolError::InvalidLcs));
-            }
-            if *len > 0 {
-                let res_packet = match Pn532Packet::from_bytes(&res[1..]) {
-                    Ok(packet) => packet,
-                    Err(e) => break Err(e),
-                };
-                if res_packet.direction != Pn532Direction::Pn532ToHost
-                    || res_packet.command != pn532_cmd
-                {
+            if !joined.is_empty() {
+                joined.extend_from_slice(res.get(1..).unwrap_or_default());
+                if joined.len() < size {
                     continue;
                 }
-                break Ok(res_packet.payload);
+            } else {
+                let Some(len) = res.get(4) else {
+                    break Err(Error::Protocol(ProtocolError::PacketTooShort));
+                };
+                let Some(len_rev) = res.get(5) else {
+                    break Err(Error::Protocol(ProtocolError::PacketTooShort));
+                };
+                if *len == 0 && *len_rev == 0xFF {
+                    // ack
+                    continue;
+                } else if (*len).wrapping_add(*len_rev) != 0 {
+                    break Err(Error::Protocol(ProtocolError::InvalidLcs));
+                }
+                if *len == 0 {
+                    continue;
+                }
+                size = *len as usize + 7;
+                // A frame of one byte more than a report arrives without its
+                // postamble; longer ones continue in the next reports.
+                if size > PN532_REPORT_BYTES + 1 {
+                    match self.supports_pn532_long_frames().await {
+                        Ok(true) => {
+                            joined.extend_from_slice(&res[1..]);
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => break Err(e),
+                    }
+                }
+                joined.extend_from_slice(&res[1..]);
             }
+            let res_packet = match Pn532Packet::from_bytes(&joined[..joined.len().min(size)]) {
+                Ok(packet) => packet,
+                Err(e) => break Err(e),
+            };
+            joined.clear();
+            if res_packet.direction != Pn532Direction::Pn532ToHost
+                || res_packet.command != pn532_cmd
+            {
+                continue;
+            }
+            break Ok(res_packet.payload);
         };
 
         let _ = self
@@ -316,6 +449,25 @@ impl HinataDevice {
             array
         };
         Ok(chip_id)
+    }
+
+    /// Whether the firmware passes PN532 frames longer than one HID report,
+    /// splitting them over several. Asked once, then remembered.
+    pub async fn supports_pn532_long_frames(&mut self) -> HinataResult<bool> {
+        if let Some(supported) = self.info.pn532_long_frames {
+            return Ok(supported);
+        }
+        let supported = if self.get_firmware_timestamp().await? < FEATURES_SINCE {
+            false
+        } else {
+            match self.request(GET_FEATURES_HEADER, &[]).await {
+                Ok(res) => res.get(1).is_some_and(|features| features & FEATURE_PN532_LONG_FRAMES != 0),
+                Err(Error::Timeout(_)) => false,
+                Err(e) => return Err(e),
+            }
+        };
+        self.info.pn532_long_frames = Some(supported);
+        Ok(supported)
     }
 
     fn get_four_bytes(data: &[u8]) -> HinataResult<[u8; 4]> {
