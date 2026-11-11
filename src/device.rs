@@ -20,6 +20,15 @@ const FEATURES_SINCE: u32 = 2026110220;
 /// PN532 frames longer than one HID report pass through, split over several.
 const FEATURE_PN532_LONG_FRAMES: u8 = 0x01;
 
+const GET_MAIN_LOOP_STATE_HEADER: u8 = 0xE3;
+/// Firmware since this build answers GET_MAIN_LOOP_STATE.
+const MAIN_LOOP_STATE_SINCE: u32 = 2025091117;
+/// Firmware since this build counts its main-loop states from a new first
+/// one (suspend prepare), so every state is one higher.
+const MAIN_LOOP_STATES_SHIFTED_SINCE: u32 = 2026051120;
+/// Main-loop state once the PN532 is up, in firmware before the shift.
+const MAIN_LOOP_NORMAL_BEFORE_SHIFT: u8 = 11;
+
 #[derive(Debug)]
 pub(crate) struct Info {
     pub firmware_timestamp: u32,
@@ -449,6 +458,46 @@ impl HinataDevice {
             array
         };
         Ok(chip_id)
+    }
+
+    /// The firmware's main-loop state machine value.
+    pub async fn get_main_loop_state(&mut self) -> HinataResult<u8> {
+        let res = self.request(GET_MAIN_LOOP_STATE_HEADER, &[]).await?;
+        res.get(1)
+            .copied()
+            .ok_or_else(|| Error::Parse("main loop state missing".into()))
+    }
+
+    /// Waits until the firmware has brought up its PN532. Until then it
+    /// drops PN532 commands: for some 400 ms after starting it neither reads
+    /// the PN532's replies nor keeps the command, which its own PN532 set-up
+    /// then replaces.
+    ///
+    /// Returns `true` once ready, or straight away for firmware too old to
+    /// report its state; `false` when [timeout] passes first or the firmware
+    /// reports an invalid device, whose PN532 it never brings up.
+    pub async fn wait_until_ready(&mut self, timeout: Duration) -> HinataResult<bool> {
+        let timestamp = self.get_firmware_timestamp().await?;
+        if timestamp < MAIN_LOOP_STATE_SINCE {
+            return Ok(true);
+        }
+        let normal = if timestamp < MAIN_LOOP_STATES_SHIFTED_SINCE {
+            MAIN_LOOP_NORMAL_BEFORE_SHIFT
+        } else {
+            MAIN_LOOP_NORMAL_BEFORE_SHIFT + 1
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let state = self.get_main_loop_state().await?;
+            if state == normal {
+                return Ok(true);
+            }
+            // The state after NORMAL is INVALID_DEVICE.
+            if state > normal || tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Whether the firmware passes PN532 frames longer than one HID report,
