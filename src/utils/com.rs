@@ -123,9 +123,23 @@ pub fn get_com_port_by_com_instance_id(instance_id: &str) -> HinataResult<String
     Ok(port_name)
 }
 
+/// Resolves the COM port of whichever HINATA is attached; passes without
+/// one, since it needs real hardware.
 #[test]
 fn get_port_test() {
-    let com_serial = get_com_instance_id_by_hid_instance_id("HID\\VID_F822&PID_0147&MI_02&Col01\\8&38333037&0&0000").unwrap();
+    let mut api = hidapi::HidApi::new().unwrap();
+    api.add_devices(0xF822, 0).unwrap();
+    let Some(instance) = api
+        .device_list()
+        .filter(|d| d.vendor_id() == 0xF822 && d.usage_page() == 1)
+        .find_map(|d| crate::utils::device_parse::parse_hid_path(&d.path().to_string_lossy()))
+        .map(|(instance, _)| instance)
+    else {
+        println!("no HINATA attached; skipped");
+        return;
+    };
+    let com_serial = get_com_instance_id_by_hid_instance_id(&instance).unwrap();
     let port = get_com_port_by_com_instance_id(&com_serial).unwrap();
-    println!("{}, {}", com_serial, port);
+    assert!(port.starts_with("COM"), "{port}");
+    println!("{instance} -> {com_serial}, {port}");
 }

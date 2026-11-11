@@ -10,7 +10,7 @@ struct StationInfo {
 }
 
 // Embed the pre-generated static mapping table
-static STATION_MAP: &[(u8, u8, u8, &str, &str)] = include!("ekicode_data.rs");
+static STATION_MAP: &[(u8, u8, u8, &str, &str)] = include!("data/ekicode_data.rs");
 
 fn load_ekicode() -> HashMap<(u8, u8, u8), StationInfo> {
     STATION_MAP
